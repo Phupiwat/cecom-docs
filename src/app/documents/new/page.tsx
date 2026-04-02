@@ -101,6 +101,10 @@ interface ParsedPO {
   dueDate: string
   poRef: string
   items: LineItem[]
+  subtotal: number      // as stated in PO
+  vatRate: number       // e.g. 7
+  vatAmount: number     // VAT baht amount as stated in PO
+  grandTotal: number    // grand total as stated in PO
 }
 
 function parseNum(s: string): number {
@@ -168,7 +172,9 @@ function extractLineItemsFromRows(rows: string[][]): LineItem[] {
       const qty = parseNum(row[qtyColIdx] || "1")
       const unitPrice = unitPriceColIdx >= 0 ? parseNum(row[unitPriceColIdx] || "0") : 0
       const total = parseNum(row[totalColIdx] || "0")
-      const descCells = row.slice(0, qtyColIdx).join(" ").replace(/^\d+[\.\)]\s*/, "").trim()
+      const descSlice1 = row.slice(0, qtyColIdx)
+      while (descSlice1.length > 0 && /^\d+$/.test(descSlice1[0].trim())) descSlice1.shift()
+      const descCells = descSlice1.join(" ").replace(/^\d+[\.\)]\s*/, "").trim()
 
       const ratio = total > 0 && qty > 0 && unitPrice > 0
         ? Math.abs(qty * unitPrice - total) / total
@@ -200,7 +206,9 @@ function extractLineItemsFromRows(rows: string[][]): LineItem[] {
           if (s2qty > 0) {
             const s2ratio = s2total > 0 ? Math.abs(s2qty * s2unitPrice - s2total) / s2total : 1
             if (s2ratio <= 0.05) {
-              const s2desc = row.slice(0, cursor + 1).join(" ").replace(/^\d+[\.\)]\s*/, "").trim()
+              const descSlice2 = row.slice(0, cursor + 1)
+              while (descSlice2.length > 0 && /^\d+$/.test(descSlice2[0].trim())) descSlice2.shift()
+              const s2desc = descSlice2.join(" ").replace(/^\d+[\.\)]\s*/, "").trim()
               if (s2desc.length >= 2) {
                 items.push({ description: s2desc, qty: s2qty, unit: s2unit, unitPrice: s2unitPrice, amount: s2total })
                 continue
@@ -305,10 +313,35 @@ function parsePO(extracted: ExtractedPDF): ParsedPO {
   const refM = text.match(/(?:เลขที่|PO\s*No\.?|P\.O\.)[:\s#]+([\w\-\/]+\d[\w\-\/]*)/i)
   if (refM) poRef = refM[1].trim()
 
+  // Tax totals
+  let poSubtotal = 0
+  let poVatRate = 7
+  let poVatAmount = 0
+  let poGrandTotal = 0
+
+  // Sub total: "รวมเงิน" / "Sub Total" / "Subtotal"
+  const subtotalM = text.match(/(?:รวม(?:เงิน)?|Sub\s*[Tt]otal)\s*:?\s*([\d,]+(?:\.\d+)?)/i)
+  if (subtotalM) poSubtotal = parseNum(subtotalM[1])
+
+  // VAT rate: "VAT 7%" / "ภาษีมูลค่าเพิ่ม 7%"
+  const vatRateM = text.match(/(?:VAT|ภาษี(?:มูลค่าเพิ่ม)?)[^\d%]*(\d+)\s*%/i)
+  if (vatRateM) poVatRate = parseInt(vatRateM[1])
+
+  // VAT amount: number that follows the "% " or "7% " part
+  const vatAmtM = text.match(/(?:VAT|ภาษี(?:มูลค่าเพิ่ม)?)[^\d%]*\d+\s*%[^:\d]*([\d,]+(?:\.\d+)?)/i)
+  if (vatAmtM) poVatAmount = parseNum(vatAmtM[1])
+
+  // Grand total: "รวมทั้งสิ้น" / "Grand Total" / "ยอดรวมสุทธิ"
+  const grandTotalM = text.match(/(?:รวมทั้งสิ้น|Grand\s*[Tt]otal|ยอดรวม(?:สุทธิ)?)\s*:?\s*([\d,]+(?:\.\d+)?)/i)
+  if (grandTotalM) poGrandTotal = parseNum(grandTotalM[1])
+
   // Line items — use structured row data for best results
   const items = extractLineItemsFromRows(rows)
 
-  return { customer, customerAddress, customerTaxId, date, dueDate, poRef, items }
+  return {
+    customer, customerAddress, customerTaxId, date, dueDate, poRef, items,
+    subtotal: poSubtotal, vatRate: poVatRate, vatAmount: poVatAmount, grandTotal: poGrandTotal,
+  }
 }
 
 // ─── Main Component ─────────────────────────────────────────────────────────────
@@ -325,7 +358,7 @@ export default function NewDocumentPage() {
   const [dueDate, setDueDate] = useState("")
   const [notes, setNotes] = useState("")
   const [items, setItems] = useState<LineItem[]>([{ ...INITIAL_ITEM }])
-  const vatRate = 7
+  const [vatRate, setVatRate] = useState(7)
 
   // Multi-doc type selection
   const [selectedTypes, setSelectedTypes] = useState<Set<DocType>>(new Set(["QT"]))
@@ -385,6 +418,8 @@ export default function NewDocumentPage() {
       if (parsed.dueDate) { setDueDate(parsed.dueDate); applied.push("วันครบกำหนด") }
       if (parsed.poRef) { setNotes(`อ้างอิง PO: ${parsed.poRef}`); applied.push("เลขที่ PO") }
       if (parsed.items.length > 0) { setItems(parsed.items); applied.push(`${parsed.items.length} รายการสินค้า`) }
+      if (parsed.vatRate && parsed.vatRate !== vatRate) { setVatRate(parsed.vatRate); applied.push(`VAT ${parsed.vatRate}%`) }
+      if (parsed.grandTotal > 0) applied.push(`ยอดรวม ${parsed.grandTotal.toLocaleString("th-TH", { minimumFractionDigits: 2 })} บาท`)
       setImportResult({
         success: true,
         message: applied.length > 0 ? `นำเข้าสำเร็จ: ${applied.join(", ")}` : "อ่านไฟล์ได้ แต่ไม่พบข้อมูลที่จะนำเข้า — ดูข้อความดิบเพื่อกรอกเอง",
