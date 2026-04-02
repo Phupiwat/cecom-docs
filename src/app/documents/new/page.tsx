@@ -50,38 +50,46 @@ declare global {
 }
 
 // ─── Structured PDF extraction ─────────────────────────────────────────────────
+interface PDFCell { x: number; y: number; text: string }
 interface ExtractedPDF {
-  text: string      // full text for display
-  rows: string[][]  // each row = cells left→right, sorted by X
+  text: string
+  rows: string[][]        // cells left→right per Y-row
+  rawCells: PDFCell[]     // all cells with exact positions
 }
 
 async function extractFromPDF(file: File): Promise<ExtractedPDF> {
   const arrayBuffer = await file.arrayBuffer()
   const pdf = await window.pdfjsLib.getDocument({ data: arrayBuffer }).promise
-  const allRows: { y: number; cells: { x: number; str: string }[] }[] = []
+  const allCells: PDFCell[] = []
 
   for (let p = 1; p <= pdf.numPages; p++) {
     const page = await pdf.getPage(p)
     const content = await page.getTextContent()
-    const rowMap = new Map<number, { x: number; str: string }[]>()
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     for (const item of content.items as any[]) {
-      if (!item.str.trim()) continue
-      const y = Math.round(item.transform[5])
-      if (!rowMap.has(y)) rowMap.set(y, [])
-      rowMap.get(y)!.push({ x: item.transform[4], str: item.str.trim() })
-    }
-    // Sort rows top→bottom (higher Y = higher on page in PDF coords)
-    const sortedYs = Array.from(rowMap.keys()).sort((a, b) => b - a)
-    for (const y of sortedYs) {
-      const cells = rowMap.get(y)!.sort((a, b) => a.x - b.x)
-      allRows.push({ y, cells })
+      const s = item.str.trim()
+      if (!s) continue
+      allCells.push({ x: item.transform[4], y: item.transform[5], text: s })
     }
   }
 
-  const rows = allRows.map((r) => r.cells.map((c) => c.str))
+  // Group into rows by Y (round to nearest 2px to merge same-line items)
+  const rowMap = new Map<number, PDFCell[]>()
+  for (const cell of allCells) {
+    const y = Math.round(cell.y / 2) * 2
+    if (!rowMap.has(y)) rowMap.set(y, [])
+    rowMap.get(y)!.push(cell)
+  }
+
+  const sortedYs = Array.from(rowMap.keys()).sort((a, b) => b - a) // top→bottom
+  const rows: string[][] = []
+  for (const y of sortedYs) {
+    const sorted = rowMap.get(y)!.sort((a, b) => a.x - b.x)
+    rows.push(sorted.map((c) => c.text))
+  }
+
   const text = rows.map((r) => r.join("  ")).join("\n")
-  return { text, rows }
+  return { text, rows, rawCells: allCells }
 }
 
 // ─── PO Parser ─────────────────────────────────────────────────────────────────
@@ -90,6 +98,7 @@ interface ParsedPO {
   customerAddress: string
   customerTaxId: string
   date: string
+  dueDate: string
   poRef: string
   items: LineItem[]
 }
@@ -100,6 +109,17 @@ function parseNum(s: string): number {
 
 function isNumericCell(s: string): boolean {
   return /^[\d,]+(\.\d+)?$/.test(s.trim())
+}
+
+const MONTHS: Record<string, number> = {
+  jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,oct:10,nov:11,dec:12
+}
+function parseMonthDate(s: string): string | null {
+  const m = s.match(/(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})/)
+  if (!m) return null
+  const mo = MONTHS[m[2].toLowerCase()]
+  if (!mo) return null
+  return `${m[3]}-${String(mo).padStart(2,"0")}-${String(parseInt(m[1])).padStart(2,"0")}`
 }
 
 // Extract line items using structured row data (much more accurate than regex-only)
@@ -162,45 +182,45 @@ function extractLineItemsFromRows(rows: string[][]): LineItem[] {
       }
     }
 
-    // ── Strategy 2: count trailing numeric cells ──────────────────────────────
-    let trailingNums = 0
-    for (let j = row.length - 1; j >= 0; j--) {
-      if (isNumericCell(row[j])) trailingNums++
-      else break
+    // ── Strategy 2: right-to-left scan ─────────────────────────────────────────
+    // Layout (right→left): total | unitPrice | [unit word] | qty | description...
+    {
+      const last = row.length - 1
+      if (last >= 2 && isNumericCell(row[last]) && isNumericCell(row[last - 1])) {
+        const s2total = parseNum(row[last])
+        const s2unitPrice = parseNum(row[last - 1])
+        if (s2total > 0 && s2unitPrice > 0) {
+          let cursor = last - 2
+          let s2unit = "ชิ้น"
+          // unit word between unitPrice and qty (e.g. "EA")
+          if (cursor >= 0 && UNIT_WORDS.test(row[cursor])) { s2unit = row[cursor]; cursor-- }
+          let s2qty = 0
+          if (cursor >= 0 && isNumericCell(row[cursor])) { s2qty = parseNum(row[cursor]); cursor-- }
+          else { s2qty = s2unitPrice > 0 ? Math.round((s2total / s2unitPrice) * 100) / 100 : 1 }
+          if (s2qty > 0) {
+            const s2ratio = s2total > 0 ? Math.abs(s2qty * s2unitPrice - s2total) / s2total : 1
+            if (s2ratio <= 0.05) {
+              const s2desc = row.slice(0, cursor + 1).join(" ").replace(/^\d+[\.\)]\s*/, "").trim()
+              if (s2desc.length >= 2) {
+                items.push({ description: s2desc, qty: s2qty, unit: s2unit, unitPrice: s2unitPrice, amount: s2total })
+                continue
+              }
+            }
+          }
+        }
+      }
     }
-    if (trailingNums < 2) continue
 
-    const numCells = row.slice(row.length - trailingNums).map(parseNum)
-    const descAndUnit = row.slice(0, row.length - trailingNums)
-
-    // Check if last descAndUnit cell is a unit word
-    let unit = "ชิ้น"
-    const lastDesc = descAndUnit[descAndUnit.length - 1] || ""
-    if (UNIT_WORDS.test(lastDesc)) {
-      unit = lastDesc
-      descAndUnit.pop()
+    // ── Continuation row: neither strategy parsed an item ───────────────────────
+    // Append non-header text to the description of the previous item
+    const SKIP_CONTINUATION = /^(Delivery Date|Storeroom|หมายเหตุ|Remark)/i
+    if (items.length > 0 && !SKIP_CONTINUATION.test(rowText.trim())) {
+      const continuation = rowText.replace(/^\d+[\.\)]\s*/, "").trim()
+      if (continuation.length > 2) {
+        const prev = items[items.length - 1]
+        items[items.length - 1] = { ...prev, description: prev.description + " " + continuation }
+      }
     }
-
-    const description = descAndUnit.join(" ").replace(/^\d+[\.\)]\s*/, "").trim()
-    if (description.length < 2) continue
-
-    // Last number = total, second-to-last = unitPrice, optionally third = qty
-    const total = numCells[numCells.length - 1]
-    const unitPrice = numCells[numCells.length - 2]
-    let qty = numCells.length >= 3 ? numCells[numCells.length - 3] : total / unitPrice
-
-    // Validate ratio
-    if (qty <= 0) continue
-    const ratio = total > 0 ? Math.abs(qty * unitPrice - total) / total : 1
-    if (ratio > 0.05) {
-      // Maybe no qty column — derive from total/unitPrice
-      qty = unitPrice > 0 ? Math.round((total / unitPrice) * 100) / 100 : 1
-      const ratio2 = total > 0 ? Math.abs(qty * unitPrice - total) / total : 1
-      if (ratio2 > 0.05) continue
-    }
-    if (total <= 0) continue
-
-    items.push({ description, qty, unit, unitPrice, amount: total })
   }
 
   return items
@@ -255,19 +275,27 @@ function parsePO(extracted: ExtractedPDF): ParsedPO {
   }
   const customerAddress = addrLines.join(" ")
 
-  // Date
+  // APPROVED DATE → date; DELIVERY DATE → dueDate
   let date = new Date().toISOString().split("T")[0]
-  const datePats = [
-    /(?:วันที่|Date)[:\s]+(\d{1,2})[\/\-\. ](\d{1,2})[\/\-\. ](\d{2,4})/i,
-    /(\d{1,2})[\/](\d{1,2})[\/](\d{4})/,
-  ]
-  for (const p of datePats) {
-    const m = text.match(p)
-    if (m) {
-      let y = parseInt(m[3]); const mo = parseInt(m[2]); const d = parseInt(m[1])
-      if (y > 2500) y -= 543; if (y < 100) y += 2000
-      if (y >= 2000 && y <= 2100 && mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
-        date = `${y}-${String(mo).padStart(2, "0")}-${String(d).padStart(2, "0")}`; break
+  let dueDate = ""
+  const approvedM = text.match(/APPROVED DATE[^:\n]*:\s*(\d{1,2}\s+\w+\s+\d{4})/i)
+  if (approvedM) { const p = parseMonthDate(approvedM[1]); if (p) date = p }
+  const deliveryM = text.match(/DELIVERY DATE[^:\n]*:\s*(\d{1,2}\s+\w+\s+\d{4})/i)
+  if (deliveryM) { const p = parseMonthDate(deliveryM[1]); if (p) dueDate = p }
+  // Fallback numeric date patterns when no APPROVED DATE found
+  if (!approvedM) {
+    const datePats = [
+      /(?:วันที่|Date)[:\s]+(\d{1,2})[\/\-\. ](\d{1,2})[\/\-\. ](\d{2,4})/i,
+      /(\d{1,2})[\/](\d{1,2})[\/](\d{4})/,
+    ]
+    for (const p of datePats) {
+      const m = text.match(p)
+      if (m) {
+        let y = parseInt(m[3]); const mo = parseInt(m[2]); const d = parseInt(m[1])
+        if (y > 2500) y -= 543; if (y < 100) y += 2000
+        if (y >= 2000 && y <= 2100 && mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+          date = `${y}-${String(mo).padStart(2,"0")}-${String(d).padStart(2,"0")}`; break
+        }
       }
     }
   }
@@ -280,7 +308,7 @@ function parsePO(extracted: ExtractedPDF): ParsedPO {
   // Line items — use structured row data for best results
   const items = extractLineItemsFromRows(rows)
 
-  return { customer, customerAddress, customerTaxId, date, poRef, items }
+  return { customer, customerAddress, customerTaxId, date, dueDate, poRef, items }
 }
 
 // ─── Main Component ─────────────────────────────────────────────────────────────
@@ -354,6 +382,7 @@ export default function NewDocumentPage() {
       if (parsed.customerAddress) { setCustomerAddress(parsed.customerAddress); applied.push("ที่อยู่") }
       if (parsed.customerTaxId) { setCustomerTaxId(parsed.customerTaxId); applied.push("เลขผู้เสียภาษี") }
       if (parsed.date) setDate(parsed.date)
+      if (parsed.dueDate) { setDueDate(parsed.dueDate); applied.push("วันครบกำหนด") }
       if (parsed.poRef) { setNotes(`อ้างอิง PO: ${parsed.poRef}`); applied.push("เลขที่ PO") }
       if (parsed.items.length > 0) { setItems(parsed.items); applied.push(`${parsed.items.length} รายการสินค้า`) }
       setImportResult({
