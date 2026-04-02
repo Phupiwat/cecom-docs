@@ -477,6 +477,15 @@ export default function NewDocumentPage() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(doc),
         })
+        if (res.status === 401) {
+          const errBody = await res.json().catch(() => ({}))
+          if (errBody.error === "SessionExpired") {
+            alert("Session หมดอายุ กรุณาเข้าสู่ระบบใหม่")
+            router.push("/login")
+            return
+          }
+          throw new Error("Unauthorized")
+        }
         if (!res.ok) throw new Error(`Failed to save ${docType}`)
         const saved = await res.json()
 

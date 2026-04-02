@@ -34,16 +34,23 @@ export async function GET() {
 export async function POST(req: NextRequest) {
   const session = await auth()
   if (!session?.accessToken) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
-  const body = await req.json()
-  const id = generateId()
-  const doc = { ...body, id, createdBy: session.user?.email || "unknown" }
-  const row = documentToRow(doc)
-  const sheets = await getSheets(session.accessToken)
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `${SHEET}!A:P`,
-    valueInputOption: "USER_ENTERED",
-    requestBody: { values: [row] },
-  })
-  return NextResponse.json({ success: true, id, docNo: doc.docNo })
+  if (session.error === "RefreshAccessTokenError")
+    return NextResponse.json({ error: "SessionExpired" }, { status: 401 })
+  try {
+    const body = await req.json()
+    const id = generateId()
+    const doc = { ...body, id, createdBy: session.user?.email || "unknown" }
+    const row = documentToRow(doc)
+    const sheets = await getSheets(session.accessToken)
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${SHEET}!A:P`,
+      valueInputOption: "USER_ENTERED",
+      requestBody: { values: [row] },
+    })
+    return NextResponse.json({ success: true, id, docNo: doc.docNo })
+  } catch (e) {
+    console.error("POST /api/documents error:", e)
+    return NextResponse.json({ error: "InternalError" }, { status: 500 })
+  }
 }
