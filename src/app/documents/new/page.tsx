@@ -179,7 +179,7 @@ function extractLineItemsFromRows(rows: string[][]): LineItem[] {
       const ratio = total > 0 && qty > 0 && unitPrice > 0
         ? Math.abs(qty * unitPrice - total) / total
         : 1
-      if (descCells.length >= 2 && total > 0 && qty > 0 && ratio < 0.05) {
+      if (descCells.length >= 2 && /[ก-๙a-zA-Z]/.test(descCells) && total > 0 && qty > 0 && ratio < 0.05) {
         const uMatch = descCells.match(new RegExp(`(${UNIT_WORDS.source})\\s*$`, "i"))
         const desc = uMatch ? descCells.replace(uMatch[0], "").trim() : descCells
         const unit = uMatch ? uMatch[1] : "ชิ้น"
@@ -209,7 +209,7 @@ function extractLineItemsFromRows(rows: string[][]): LineItem[] {
               const descSlice2 = row.slice(0, cursor + 1)
               while (descSlice2.length > 0 && /^\d+$/.test(descSlice2[0].trim())) descSlice2.shift()
               const s2desc = descSlice2.join(" ").replace(/^\d+[\.\)]\s*/, "").trim()
-              if (s2desc.length >= 2) {
+              if (s2desc.length >= 2 && /[ก-๙a-zA-Z]/.test(s2desc)) {
                 items.push({ description: s2desc, qty: s2qty, unit: s2unit, unitPrice: s2unitPrice, amount: s2total })
                 continue
               }
@@ -238,6 +238,10 @@ function parsePO(extracted: ExtractedPDF): ParsedPO {
   const { text, rows } = extracted
   const lines = text.split("\n").map((l) => l.trim()).filter(Boolean)
 
+  // Cecom's own identifiers — used to skip Cecom's data when parsing customer info
+  const CECOM_TAX_ID = "0215555002082"
+  const CECOM_ADDR_KW = /สุขาภิบาล|ออเงิน|สายไหม|0215555002082/
+
   // Tax ID
   let customerTaxId = ""
   const taxPatterns = [
@@ -246,42 +250,62 @@ function parsePO(extracted: ExtractedPDF): ParsedPO {
     /\b(\d{13})\b/,
   ]
   for (const p of taxPatterns) {
-    const m = text.match(p)
-    if (m) {
+    for (const m of text.matchAll(new RegExp(p.source, p.flags + "g"))) {
       const c = m[1].replace(/[-\s]/g, "")
-      if (c.length === 13) { customerTaxId = c; break }
+      if (c.length === 13 && c !== CECOM_TAX_ID) { customerTaxId = c; break }
     }
+    if (customerTaxId) break
   }
 
-  // Company name
+  // Company name — scan individual cells (rows[][]) to avoid row-join pollution
+  // (PDF.js may place company name and PO header on the same Y-line)
   let customer = ""
-  for (const line of lines) {
-    if (/^บริษัท|^ห้างหุ้นส่วน|^ร้าน/.test(line)) {
-      customer = line.replace(/\s*\(.*?\)\s*$/, "").trim(); break
+  outerCust: for (const row of rows) {
+    for (const cell of row) {
+      const c = cell.trim()
+      if (
+        /^(?:บริษัท|ห้างหุ้นส่วน|ร้าน)\s+\S/.test(c) &&
+        c.length <= 50 &&
+        !CECOM_ADDR_KW.test(c) &&
+        !/PO|NUMBER|เลขที่ใบ/.test(c)
+      ) {
+        customer = c.replace(/\s*\(.*?\)\s*$/, "").trim()
+        break outerCust
+      }
     }
   }
   if (!customer) {
-    const m = text.match(/(บริษัท[^\n,]{2,50}(?:จำกัด|จก\.|Ltd\.?))/i)
+    const m = text.match(/((?:บริษัท|ห้างหุ้นส่วน)\s+[^\n\t,(]{2,40}(?:จำกัด|จก\.|มหาชน))/i)
     if (m) customer = m[1].trim()
   }
 
-  // Address
-  const addrKeywords = /ถนน|ซอย|แขวง|เขต|ตำบล|อำเภอ|จังหวัด|ถ\.|ซ\.|กรุงเทพ|Bangkok|นนทบุรี|ปทุมธานี|เชียงใหม่|ชลบุรี/
-  const addrLines: string[] = []
-  let pastCompany = false
-  for (const line of lines) {
-    if (line === customer) { pastCompany = true; continue }
-    if (pastCompany && addrLines.length < 3) {
-      if (addrKeywords.test(line) && line.length > 5) addrLines.push(line)
-      else if (addrLines.length > 0 && /\d{5}/.test(line)) { addrLines.push(line); break }
-    }
+  // Address — Strategy 1: find "จัดส่งสินค้า" / "Ship To" marker, take address after it
+  let customerAddress = ""
+  const shipToM = text.match(/จัดส่งสินค้า\s+([^\n]+?)(?:ติดต่อ|โทร|Tel|Contact|$)/i)
+  if (shipToM) {
+    // Grab through the postal code (5 digits)
+    const raw = shipToM[1].replace(/\s+/g, " ").trim()
+    const zipM = raw.match(/^(.+?\d{5})/)
+    customerAddress = zipM ? zipM[1].trim() : raw
   }
-  if (addrLines.length === 0) {
-    for (const line of lines) {
-      if (addrKeywords.test(line) && line.length > 10) { addrLines.push(line); if (addrLines.length >= 2) break }
+  // Strategy 2: scan cells, skip Cecom's own address
+  if (!customerAddress) {
+    const addrKw = /ถนน|ซอย|หมู่|แขวง|เขต|ตำบล|อำเภอ|จังหวัด|ถ\.|ต\.|อ\.|จ\./
+    const addrParts: string[] = []
+    let pastCust = false
+    for (const row of rows) {
+      const joined = row.join(" ")
+      if (!pastCust && joined.includes(customer.slice(0, 8))) { pastCust = true; continue }
+      if (!pastCust) continue
+      if (CECOM_ADDR_KW.test(joined)) continue
+      for (const cell of row) {
+        const c = cell.trim()
+        if (addrKw.test(c) && c.length > 10 && !CECOM_ADDR_KW.test(c)) addrParts.push(c)
+      }
+      if (addrParts.length >= 1) break
     }
+    customerAddress = addrParts.join(" ")
   }
-  const customerAddress = addrLines.join(" ")
 
   // APPROVED DATE → date; DELIVERY DATE → dueDate
   let date = new Date().toISOString().split("T")[0]
