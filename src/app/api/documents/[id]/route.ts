@@ -32,10 +32,10 @@ export async function GET(
   const sheets = await getSheets(session.accessToken)
   const idx = await findRowIndex(sheets, id)
   if (idx < 0) return NextResponse.json({ error: "Not found" }, { status: 404 })
-  const sheetRow = idx + 1 // 1-based, header is row 1
+  const sheetRow = idx + 1 // rows[idx] → sheet row idx+1 (header is row 1, data starts row 2)
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
-    range: `${SHEET}!A${sheetRow + 1}:P${sheetRow + 1}`,
+    range: `${SHEET}!A${sheetRow}:P${sheetRow}`,
   })
   const row = res.data.values?.[0]
   if (!row) return NextResponse.json({ error: "Not found" }, { status: 404 })
@@ -53,7 +53,7 @@ export async function PUT(
   const sheets = await getSheets(session.accessToken)
   const idx = await findRowIndex(sheets, id)
   if (idx < 0) return NextResponse.json({ error: "Not found" }, { status: 404 })
-  const sheetRow = idx + 2 // 1-based, +1 for header
+  const sheetRow = idx + 1 // rows[idx] → sheet row idx+1
   const doc = { ...body, id }
   const row = documentToRow(doc)
   await sheets.spreadsheets.values.update({
